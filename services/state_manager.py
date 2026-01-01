@@ -2,6 +2,9 @@
 Unified State Management Service
 Centralized state management with Replit Key-Value Store backend for the LockBay Telegram bot system
 Provides distributed coordination, session management, and state consistency
+
+RAILWAY COMPATIBILITY: Falls back to in-memory storage when Replit KV is unavailable.
+This works for single-instance deployments (Railway VMs).
 """
 
 import json
@@ -13,6 +16,7 @@ from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict
 import uuid
+import os
 
 # Import Replit Key-Value Store
 try:
@@ -25,6 +29,60 @@ except ImportError:
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+
+class InMemoryKVStore:
+    """
+    In-memory Key-Value Store for Railway/non-Replit environments.
+    Provides dict-like interface compatible with Replit's db.
+    
+    NOTE: Data is NOT persisted across restarts. Use only for:
+    - Session state (temporary)
+    - Distributed locks (single instance only)
+    - Cache data (can be rebuilt)
+    """
+    
+    def __init__(self):
+        self._data: Dict[str, str] = {}
+        self._lock = asyncio.Lock()
+        logger.info("📦 InMemoryKVStore initialized (Railway fallback mode)")
+    
+    def get(self, key: str, default: Any = None) -> Optional[str]:
+        """Get value by key"""
+        return self._data.get(key, default)
+    
+    def __getitem__(self, key: str) -> str:
+        """Dict-like get"""
+        return self._data[key]
+    
+    def __setitem__(self, key: str, value: str):
+        """Dict-like set"""
+        self._data[key] = value
+    
+    def __delitem__(self, key: str):
+        """Dict-like delete"""
+        if key in self._data:
+            del self._data[key]
+    
+    def __contains__(self, key: str) -> bool:
+        """Check if key exists"""
+        return key in self._data
+    
+    def keys(self):
+        """Return all keys"""
+        return self._data.keys()
+    
+    def prefix(self, prefix: str) -> List[str]:
+        """Return keys matching prefix"""
+        return [k for k in self._data.keys() if k.startswith(prefix)]
+    
+    def clear(self):
+        """Clear all data"""
+        self._data.clear()
+
+
+# Create in-memory fallback store
+_memory_store = InMemoryKVStore()
 
 
 def _normalize_tags(tags: Any) -> List[str]:
@@ -205,11 +263,20 @@ class StateManager:
     - Session management with TTL
     - State versioning and conflict detection
     - Simple atomic operations
+    
+    RAILWAY SUPPORT: Falls back to in-memory storage when Replit KV unavailable.
     """
 
     def __init__(self):
-        self.kv_store = db
-        self.is_connected = KV_AVAILABLE
+        # Use Replit KV if available, otherwise use in-memory fallback
+        if KV_AVAILABLE and db is not None:
+            self.kv_store = db
+            self._using_memory_fallback = False
+        else:
+            self.kv_store = _memory_store
+            self._using_memory_fallback = True
+        
+        self.is_connected = False  # Will be set to True after initialize()
         self._financial_ops_enabled = True
         
         # State management configuration from Config
@@ -282,7 +349,20 @@ class StateManager:
         }
 
     async def initialize(self) -> bool:
-        """Initialize Key-Value Store connection"""
+        """Initialize Key-Value Store connection (with in-memory fallback for Railway)"""
+        
+        # If using in-memory fallback, initialize immediately
+        if self._using_memory_fallback:
+            self.is_connected = True
+            logger.info("📦 State Manager initialized with IN-MEMORY storage (Railway mode)")
+            logger.info("⚠️ Note: State data will NOT persist across restarts")
+            logger.info("🔒 Financial operations safety: ENABLED (in-memory locks work for single instance)")
+            
+            # Start background TTL cleanup
+            asyncio.create_task(self._ttl_cleanup_task())
+            return True
+        
+        # Replit KV Store path
         if not KV_AVAILABLE:
             logger.error("❌ Replit Key-Value Store not available - replit library not installed")
             self.is_connected = False
