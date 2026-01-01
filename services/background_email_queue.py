@@ -7,6 +7,9 @@ Features:
 - Background processing with ReplitQueue
 - Retry logic for failed email deliveries
 - Performance monitoring and error handling
+
+RAILWAY COMPATIBILITY: Gracefully degrades to no-op mode when Replit KV unavailable.
+The caller should handle fallback to direct email sending (already implemented in email_verification_service.py).
 """
 
 import asyncio
@@ -16,7 +19,15 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 
-from webhook_queue.redis_queue import ReplitQueue, Priority, QueueConfig
+try:
+    from webhook_queue.redis_queue import ReplitQueue, Priority, QueueConfig
+    QUEUE_AVAILABLE = True
+except ImportError:
+    QUEUE_AVAILABLE = False
+    ReplitQueue = None
+    Priority = None
+    QueueConfig = None
+
 from services.email import EmailService
 from services.email_templates import create_unified_email_template
 from config import Config
@@ -37,19 +48,31 @@ class EmailJob:
 
 
 class BackgroundEmailQueue:
-    """Background email processing queue for high-performance webhook responses"""
+    """Background email processing queue for high-performance webhook responses
+    
+    RAILWAY COMPATIBILITY: When Replit KV Store is unavailable, operates in "no-op" mode.
+    Queue operations return failure, triggering the caller's fallback to direct email sending.
+    """
     
     QUEUE_NAME = "email_processing"
     MAX_RETRIES = 3
     RETRY_DELAYS = [30, 120, 300]  # 30s, 2m, 5m
     
     def __init__(self):
-        self.queue_config = QueueConfig()
-        self.queue_config.default_queue = self.QUEUE_NAME
-        self.queue_config.max_workers = 1  # Single worker to prevent duplicate processing due to KV store limitations
-        self.queue_config.retry_delays = self.RETRY_DELAYS
+        self._queue_available = QUEUE_AVAILABLE
+        self._noop_mode = False
         
-        self.replit_queue = ReplitQueue(config=self.queue_config)
+        if QUEUE_AVAILABLE and QueueConfig is not None:
+            self.queue_config = QueueConfig()
+            self.queue_config.default_queue = self.QUEUE_NAME
+            self.queue_config.max_workers = 1  # Single worker to prevent duplicate processing
+            self.queue_config.retry_delays = self.RETRY_DELAYS
+            self.replit_queue = ReplitQueue(config=self.queue_config)
+        else:
+            self.queue_config = None
+            self.replit_queue = None
+            self._noop_mode = True
+        
         self.email_service = EmailService()
         self._is_initialized = False
         
@@ -59,13 +82,25 @@ class BackgroundEmailQueue:
             "emails_sent": 0,
             "emails_failed": 0,
             "average_processing_time": 0.0,
-            "last_processed": None
+            "last_processed": None,
+            "noop_mode": self._noop_mode
         }
     
     async def initialize(self) -> bool:
-        """Initialize the background email queue system"""
+        """Initialize the background email queue system
+        
+        RAILWAY MODE: Returns True but operates in no-op mode.
+        Queue operations will fail gracefully, triggering direct email fallback.
+        """
         try:
             if self._is_initialized:
+                return True
+            
+            # No-op mode for Railway (Replit KV unavailable)
+            if self._noop_mode:
+                self._is_initialized = True
+                logger.info("📧 Background Email Queue initialized in NO-OP mode (Railway)")
+                logger.info("⚠️ Emails will be sent directly instead of queued (fallback mode)")
                 return True
                 
             logger.info("🚀 Initializing Background Email Queue...")
@@ -84,8 +119,12 @@ class BackgroundEmailQueue:
             return True
             
         except Exception as e:
-            logger.error(f"❌ Failed to initialize Background Email Queue: {e}")
-            return False
+            # On failure, switch to no-op mode instead of failing completely
+            logger.warning(f"⚠️ Background Email Queue falling back to NO-OP mode: {e}")
+            self._noop_mode = True
+            self._is_initialized = True
+            self.metrics["noop_mode"] = True
+            return True  # Return True so startup continues
     
     async def queue_otp_email(
         self,
@@ -107,7 +146,18 @@ class BackgroundEmailQueue:
             
         Returns:
             Dict with immediate response and job ID
+            
+        RAILWAY MODE: Returns failure in no-op mode to trigger direct email fallback.
         """
+        # No-op mode: Return failure to trigger direct email fallback
+        if self._noop_mode or self.replit_queue is None:
+            logger.debug(f"📧 NO-OP mode: Triggering direct email fallback for {recipient}")
+            return {
+                "success": False,
+                "error": "queue_unavailable",
+                "message": "Queue in no-op mode, use direct email sending"
+            }
+        
         try:
             # Create optimized email content
             subject = f"🔐 Your verification code: {otp_code}"
@@ -163,6 +213,13 @@ class BackgroundEmailQueue:
         user_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """Queue welcome email for background processing"""
+        if self._noop_mode or self.replit_queue is None:
+            logger.debug(f"📧 NO-OP mode: Triggering fallback for welcome email to {recipient}")
+            return {
+                "success": False,
+                "error": "queue_unavailable",
+                "message": "Queue in no-op mode"
+            }
         try:
             # Create welcome email content
             subject = f"🎉 Welcome to {Config.PLATFORM_NAME}!"
@@ -238,6 +295,13 @@ class BackgroundEmailQueue:
         Returns:
             Dict with immediate response and job ID
         """
+        if self._noop_mode or self.replit_queue is None:
+            logger.debug(f"📧 NO-OP mode: Triggering fallback for dispute notification to {recipient}")
+            return {
+                "success": False,
+                "error": "queue_unavailable",
+                "message": "Queue in no-op mode"
+            }
         try:
             # Create optimized dispute notification email content
             subject = f"⚖️ Dispute Message: #{dispute_id} | {sender_role} | ${escrow_amount:.2f}"
