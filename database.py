@@ -7,6 +7,7 @@ functionality for the LockBay Telegram Escrow Bot.
 """
 
 import logging
+import asyncio
 from contextlib import contextmanager, asynccontextmanager
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, Session
