@@ -107,6 +107,7 @@ class OnboardingService:
         else:
             # Self-managed session - full transaction policy using sync approach
             from services.background_email_queue import background_email_queue
+            import asyncio
             
             def sync_session_work():
                 with managed_session() as session:
