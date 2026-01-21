@@ -645,12 +645,20 @@ class EmailVerificationService:
                         html_content=html_content
                     )
                 else:
-                    email_service.send_email(
-                        to_email=email,
-                        subject=subject,
-                        html_content=html_content
-                    )
-                    email_sent = True
+                    # Threaded fallback for sync environments
+                    if asyncio.iscoroutinefunction(email_service.send_email):
+                         email_sent = await email_service.send_email(
+                            to_email=email,
+                            subject=subject,
+                            html_content=html_content
+                        )
+                    else:
+                        email_service.send_email(
+                            to_email=email,
+                            subject=subject,
+                            html_content=html_content
+                        )
+                        email_sent = True
                 logger.info(f"✅ OTP email sent DIRECTLY to {email} for user {user_id}")
             except Exception as email_error:
                 logger.error(f"❌ Failed to send OTP email to {email}: {email_error}")
