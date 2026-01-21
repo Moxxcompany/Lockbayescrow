@@ -15,6 +15,7 @@ The caller should handle fallback to direct email sending (already implemented i
 import asyncio
 import logging
 import json
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
@@ -360,6 +361,8 @@ class BackgroundEmailQueue:
     
     async def _process_email_job(self, email_job_data: Dict[str, Any]) -> Dict[str, Any]:
         """Background job processor for email sending"""
+        # Ensure asyncio is available in this context
+        import asyncio
         start_time = datetime.utcnow()
         
         try:
