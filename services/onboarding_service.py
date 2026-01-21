@@ -330,13 +330,44 @@ class OnboardingService:
                             "job_id": queue_result.get("job_id")
                         }
                     else:
-                        logger.error(f"❌ EMAIL_QUEUE_FAILED: OTP created but email queue failed for user {user_id}: {queue_result.get('error')}")
-                        return {
-                            "success": False,
-                            "error": "email_queue_failed",
-                            "message": "OTP created but email sending failed",
-                            "details": queue_result.get('error')
-                        }
+                        # FIXED: Implement direct fallback if queue fails
+                        logger.warning(f"⚠️ QUEUE_FAILED: Falling back to direct email send for onboarding user {user_id}")
+                        from services.email import EmailService
+                        email_service = EmailService()
+                        
+                        from services.email_templates import create_unified_email_template
+                        html_content = create_unified_email_template(
+                            title="📧 Email Verification",
+                            content="Please verify your email address to complete registration.",
+                            otp_code=actual_otp_code,
+                            user_name=actual_user_name
+                        )
+                        
+                        direct_success = await email_service.send_email_async(
+                            to_email=email,
+                            subject=f"🔐 Your verification code: {actual_otp_code}",
+                            html_content=html_content
+                        )
+                        
+                        if direct_success:
+                            logger.info(f"✅ DIRECT_SEND_SUCCESS: OTP sent directly to {email} after queue fail")
+                            return {
+                                "success": True,
+                                "message": "OTP created and sent directly",
+                                "otp_expires_in_minutes": otp_result.get('expires_in_minutes'),
+                                "max_attempts": otp_result.get('max_attempts'),
+                                "resend_cooldown_seconds": otp_result.get('resend_cooldown_seconds'),
+                                "email_queued": False,
+                                "email_sent_directly": True
+                            }
+                        else:
+                            logger.error(f"❌ ALL_SEND_METHODS_FAILED: OTP created but email delivery failed for user {user_id}")
+                            return {
+                                "success": False,
+                                "error": "email_send_failed",
+                                "message": "OTP created but email sending failed",
+                                "details": "Both queue and direct send failed"
+                            }
             
             # Execute the OTP creation and queuing
             result = await _create_otp_and_queue()
