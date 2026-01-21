@@ -345,7 +345,35 @@ class EmailVerificationService:
             
             # CRITICAL FIX: Trigger background email send IMMEDIATELY after record creation
             # Previously this was missing in some paths, causing records to exist but emails not to fire
-            logger.info(f"🚀 TRIGGER_EMAIL: Queueing background email for verification {verification_id}")
+            logger.info(f"🚀 TRIGGER_EMAIL: Sending OTP directly for verification {verification_id} (fallback for reliability)")
+            try:
+                from services.email import EmailService
+                email_service = EmailService()
+                
+                # Create optimized email content
+                subject = f"🔐 Your verification code: {otp_code}"
+                
+                # Use the user's first name if available
+                user_display_name = "User"
+                if user and hasattr(user, 'first_name') and user.first_name:
+                    user_display_name = user.first_name
+                
+                # Check if background_email_queue is initialized and in no-op mode
+                # If so, or if we want maximum reliability for OTP, send directly
+                html_content = cls._create_otp_email_html(otp_code, user_display_name, purpose)
+                success = email_service.send_email(
+                    to_email=email,
+                    subject=subject,
+                    html_content=html_content
+                )
+                if success:
+                    logger.info(f"✅ OTP email sent directly to {email}")
+                else:
+                    logger.error(f"❌ Direct OTP email send failed for {email}")
+            except Exception as email_err:
+                logger.error(f"❌ Error in direct OTP email send: {email_err}")
+
+            # Also queue in background if possible for redundancy/tracking
             asyncio.create_task(cls._send_email_background_task_safe(
                 verification_id=verification_id,
                 email=email,
@@ -390,6 +418,76 @@ class EmailVerificationService:
         remaining_seconds = int((cooldown_period - time_since_creation).total_seconds())
         logger.debug(f"Resend cooldown for user {user_id}: {remaining_seconds}s remaining")
         return False, remaining_seconds
+
+    @classmethod
+    def _create_otp_email_html(
+        cls,
+        otp_code: str,
+        user_name: str,
+        purpose: str
+    ) -> str:
+        """Helper to create OTP email HTML content directly"""
+        purpose_configs = {
+            'registration': {
+                'title': '📧 Email Verification',
+                'message': 'Please verify your email address to complete registration.',
+                'color': '#007bff'
+            },
+            'cashout': {
+                'title': '🔐 Secure Your Cashout',
+                'message': 'Please verify this cashout request with the code below.',
+                'color': '#28a745'
+            },
+            'change_email': {
+                'title': '🔄 Email Change Verification',
+                'message': 'Please verify your new email address.',
+                'color': '#6f42c1'
+            }
+        }
+        
+        config = purpose_configs.get(purpose, purpose_configs['registration'])
+        
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>{config['title']}</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f8f9fa;">
+            <div style="background: white; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+                <div style="text-align: center; margin-bottom: 30px;">
+                    <h1 style="color: {config['color']}; margin: 0; font-size: 24px;">{config['title']}</h1>
+                    <p style="color: #6c757d; margin: 10px 0 0 0;">{Config.PLATFORM_NAME} Secure Platform</p>
+                </div>
+                <div style="text-align: center;">
+                    <p style="color: #333; font-size: 16px; margin-bottom: 20px;">
+                        Hello {user_name}! 👋
+                    </p>
+                    <p style="color: #333; font-size: 16px; margin-bottom: 30px;">
+                        {config['message']}
+                    </p>
+                    <div style="background: linear-gradient(135deg, {config['color']}, {config['color']}dd); padding: 25px; border-radius: 10px; margin: 25px 0;">
+                        <p style="color: white; margin: 0 0 10px 0; font-size: 14px;">Your verification code:</p>
+                        <div style="font-size: 32px; font-weight: bold; color: white; letter-spacing: 5px; font-family: monospace;">
+                            {otp_code}
+                        </div>
+                    </div>
+                    <p style="color: #dc3545; font-size: 14px; margin: 20px 0;">
+                        ⏰ This code expires in 15 minutes
+                    </p>
+                </div>
+                <div style="text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e9ecef;">
+                    <p style="color: #6c757d; font-size: 12px; margin: 0;">
+                        This is an automated message from {Config.PLATFORM_NAME}<br>
+                        If you didn't request this, please ignore this email.
+                    </p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
 
     @classmethod
     async def _send_email_background_task_safe(
