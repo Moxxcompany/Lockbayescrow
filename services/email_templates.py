@@ -4,7 +4,7 @@ from config import Config
 from typing import Dict, Any
 
 
-def create_unified_email_template(title: str, content: str, otp_code: str = None, expiry_minutes: int = 10) -> str:
+def create_unified_email_template(title: str, content: str, otp_code: str = None, expiry_minutes: int = 10, user_name: str = "User") -> str:
     """
     Create a unified email template with consistent styling
     
@@ -13,6 +13,7 @@ def create_unified_email_template(title: str, content: str, otp_code: str = None
         content: Main email content
         otp_code: Optional OTP code to display prominently
         expiry_minutes: OTP expiry time in minutes
+        user_name: Optional user name for personalization
     
     Returns:
         HTML email content with consistent styling
@@ -21,7 +22,7 @@ def create_unified_email_template(title: str, content: str, otp_code: str = None
     if otp_code:
         otp_section = f"""
         <div style="margin: 30px 0; text-align: center;">
-            <p style="font-size: 16px; color: #374151; margin-bottom: 15px;">Your verification code is:</p>
+            <p style="font-size: 16px; color: #374151; margin-bottom: 15px;">Hello {user_name}, your verification code is:</p>
             <div style="background: #f0f0f0; padding: 20px; border-radius: 8px; margin: 20px 0; text-align: center;">
                 <h1 style="font-family: monospace; font-size: 32px; letter-spacing: 5px; color: #1f2937; margin: 0;">{otp_code}</h1>
             </div>
