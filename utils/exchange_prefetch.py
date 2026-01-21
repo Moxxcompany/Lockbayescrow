@@ -1,308 +1,605 @@
+#!/usr/bin/env python3
 """
-Exchange Context Prefetch Utility
-Batches database queries to reduce exchange operation latency from ~800ms to <150ms
-
-QUERY COUNT REDUCTION:
-===========================================
-BEFORE: 57 queries across exchange flows
-  - Query 1: SELECT user FROM users WHERE id = ?
-  - Query 2-8: SELECT each wallet individually (USD, NGN, BTC, ETH, LTC, USDT-ERC20, USDT-TRC20)
-  - Query 9: SELECT saved_addresses WHERE user_id = ?
-  - Query 10: SELECT saved_bank_accounts WHERE user_id = ?
-  - Query 11-20: Rate lookups for exchange pairs
-  - Query 21-30: Balance validation queries for each currency
-  - Query 31-40: Exchange limit checks and fee calculations
-  - Query 41-57: Destination validation and availability checks
-  
-AFTER: 2 queries with batching
-  - Query 1: SELECT user, wallets FROM users LEFT JOIN wallets ON ... WHERE user_id = ?
-  - Query 2: SELECT addresses, banks (sequential - SQLAlchemy requirement)
-
-RESULT: 96% reduction (57 queries → 2 queries)
-===========================================
-
-OPTIMIZATION STRATEGY:
-- Phase 1: Prefetch user + all wallets + saved destinations in 2 batched queries (~150ms vs 800ms sequential)
-- Phase 2: Cache data in context.user_data for reuse across all exchange operations (0 queries for subsequent steps)
-- Phase 3: Auto-create missing wallets to eliminate future queries
-- Phase 4: Eliminate redundant queries throughout exchange flows
+Exchange Rate Fallback System
+Comprehensive multi-tier rate fetching with circuit breaker and stale data tolerance
 """
 
 import logging
-import time
-from typing import Dict, Any, Optional, List
+import aiohttp
+from datetime import datetime, timedelta
+from typing import Dict, Optional, Any, Tuple
 from decimal import Decimal
-from dataclasses import dataclass, asdict
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from dataclasses import dataclass
+from enum import Enum
 
-from models import User, Wallet, SavedAddress, SavedBankAccount
+from database import SessionLocal
 from config import Config
-from utils.wallet_prefetch import WalletData, SavedAddressData, SavedBankData
+from utils.production_cache import get_cached, set_cached
 
 logger = logging.getLogger(__name__)
 
 
+class RateSource(Enum):
+    """Rate source providers"""
+
+    FASTFOREX = "fastforex"
+    COINGECKO = "coingecko"
+    COINAPI = "coinapi"
+    EXCHANGERATES = "exchangerates"
+    CACHE = "cache"
+    STALE_CACHE = "stale_cache"
+    DEFAULT = "default"
+
+
 @dataclass
-class ExchangePrefetchData:
-    """Container for all prefetched exchange context data"""
-    # User info
-    user_id: int
-    telegram_id: int
-    username: Optional[str]
-    email: Optional[str]
-    phone_number: Optional[str]
-    
-    # Wallets for exchange (reuse WalletData from wallet_prefetch)
-    wallets: Dict[str, WalletData]  # currency -> WalletData
-    
-    # Saved destinations (for exchange outputs)
-    saved_crypto_addresses: List[SavedAddressData]
-    saved_bank_accounts: List[SavedBankData]
-    
-    # Exchange limits from Config
-    min_exchange_amount_usd: Decimal
-    exchange_markup_percentage: Decimal
-    
-    # Performance tracking
-    prefetch_duration_ms: float
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for context storage"""
-        return asdict(self)
+class RateResult:
+    """Rate fetch result with metadata"""
+
+    rate: Optional[Decimal]
+    source: RateSource
+    timestamp: datetime
+    currency_pair: str
+    confidence: float  # 0.0 to 1.0
+    is_stale: bool = False
+    error_message: Optional[str] = None
 
 
-async def prefetch_exchange_context(user_id: int, session: AsyncSession) -> Optional[ExchangePrefetchData]:
-    """
-    BATCHED EXCHANGE CONTEXT: Reduce 57 queries to 2 queries
-    
-    BEFORE: Multiple sequential queries
-    - Query 1: SELECT user
-    - Query 2-8: SELECT each wallet individually (USD, NGN, BTC, ETH, LTC, USDT-ERC20, USDT-TRC20)
-    - Query 9: SELECT saved addresses
-    - Query 10: SELECT saved banks
-    - Query 11-20: Rate lookups for exchange pairs
-    - Query 21-30: Balance validation queries
-    - Query 31-40: Exchange limit checks
-    - Query 41-57: Destination validation
-    
-    AFTER: 2 queries with JOINs
-    - Query 1: SELECT user + all wallets (LEFT JOIN)
-    - Query 2: SELECT addresses + banks (sequential)
-    
-    Performance: ~800ms → ~150ms (81% reduction)
-    
-    Args:
-        user_id: Database user ID (not telegram_id)
-        session: Async database session
-        
-    Returns:
-        ExchangePrefetchData with all context, or None if user not found
-    """
-    start_time = time.perf_counter()
-    
-    try:
-        # Query 1: User + All Wallets in one query (LEFT JOIN - user may have no wallets yet)
-        stmt = (
-            select(User, Wallet)
-            .outerjoin(Wallet, Wallet.user_id == User.id)
-            .where(User.id == user_id)
+@dataclass
+class CircuitBreakerState:
+    """Circuit breaker state for API endpoints"""
+
+    failure_count: int = 0
+    last_failure: Optional[datetime] = None
+    is_open: bool = False
+    recovery_timeout: int = 300  # 5 minutes
+    failure_threshold: int = 3
+
+
+class ExchangeRateFallbackService:
+    """Comprehensive exchange rate service with multiple fallbacks and circuit breakers"""
+
+    def __init__(self):
+        self.cache_duration = 300  # 5 minutes normal cache
+        self.stale_tolerance = 3600  # 1 hour stale data tolerance
+        self.default_rates = self._load_default_rates()
+        self.circuit_breakers: Dict[str, CircuitBreakerState] = {}
+
+        # Rate source configurations
+        self.sources_config = {
+            RateSource.FASTFOREX: {"timeout": 10, "retry_count": 2, "confidence": 0.95},
+            RateSource.COINGECKO: {"timeout": 8, "retry_count": 2, "confidence": 0.90},
+            RateSource.COINAPI: {"timeout": 12, "retry_count": 1, "confidence": 0.85},
+            RateSource.EXCHANGERATES: {
+                "timeout": 10,
+                "retry_count": 1,
+                "confidence": 0.80,
+            },
+        }
+
+    def _load_default_rates(self) -> Dict[str, Decimal]:
+        """Load conservative default rates for emergency fallback"""
+        return {
+            # Crypto to USD (conservative estimates)
+            "BTC": Decimal("35000.00"),
+            "ETH": Decimal("2000.00"),
+            "LTC": Decimal("70.00"),
+            "DOGE": Decimal("0.08"),
+            "BCH": Decimal("250.00"),
+            "BNB": Decimal("220.00"),
+            "TRX": Decimal("0.06"),
+            "USDT": Decimal("1.00"),
+            # USD to Fiat
+            "USD_NGN": Decimal("1600.00"),  # Conservative NGN rate
+            "USD_EUR": Decimal("0.85"),
+            "USD_GBP": Decimal("0.75"),
+        }
+
+    def _get_circuit_breaker(self, source: str) -> CircuitBreakerState:
+        """Get or create circuit breaker for a source"""
+        if source not in self.circuit_breakers:
+            self.circuit_breakers[source] = CircuitBreakerState()
+        return self.circuit_breakers[source]
+
+    def _is_circuit_open(self, source: str) -> bool:
+        """Check if circuit breaker is open for a source"""
+        cb = self._get_circuit_breaker(source)
+
+        if not cb.is_open:
+            return False
+
+        # Check if recovery timeout has passed
+        if cb.last_failure and datetime.utcnow() - cb.last_failure > timedelta(
+            seconds=cb.recovery_timeout
+        ):
+            cb.is_open = False
+            cb.failure_count = 0
+            logger.info(f"Circuit breaker reset for {source}")
+            return False
+
+        return True
+
+    def _record_failure(self, source: str, error: str):
+        """Record API failure and potentially open circuit breaker"""
+        cb = self._get_circuit_breaker(source)
+        cb.failure_count += 1
+        cb.last_failure = datetime.utcnow()
+
+        if cb.failure_count >= cb.failure_threshold:
+            cb.is_open = True
+            logger.warning(
+                f"Circuit breaker opened for {source} after {cb.failure_count} failures"
+            )
+
+        logger.warning(f"API failure recorded for {source}: {error}")
+
+    def _record_success(self, source: str):
+        """Record API success and reset circuit breaker"""
+        cb = self._get_circuit_breaker(source)
+        if cb.failure_count > 0 or cb.is_open:
+            logger.info(f"API recovery for {source}, resetting circuit breaker")
+
+        cb.failure_count = 0
+        cb.is_open = False
+        cb.last_failure = None
+
+    async def get_crypto_to_usd_rate(self, crypto: str) -> RateResult:
+        """Get crypto to USD rate with comprehensive fallbacks"""
+        currency_pair = f"{crypto.upper()}_USD"
+
+        # Try multiple sources in order of preference
+        sources = [
+            (RateSource.FASTFOREX, self._fetch_fastforex_crypto_rate),
+            (RateSource.COINGECKO, self._fetch_coingecko_crypto_rate),
+            (RateSource.COINAPI, self._fetch_coinapi_crypto_rate),
+        ]
+
+        for source, fetch_func in sources:
+            if self._is_circuit_open(source.value):
+                logger.debug(f"Skipping {source.value} - circuit breaker open")
+                continue
+
+            try:
+                result = await fetch_func(crypto)
+                if result and result.rate:
+                    self._record_success(source.value)
+                    await self._cache_rate(currency_pair, result.rate, source)
+                    return result
+            except Exception as e:
+                self._record_failure(source.value, str(e))
+                continue
+
+        # Try cached data (fresh then stale)
+        cached_result = await self._get_cached_rate(currency_pair)
+        if cached_result:
+            return cached_result
+
+        # Last resort: default rate
+        default_rate = self.default_rates.get(crypto.upper())
+        if default_rate:
+            logger.warning(f"Using default rate for {crypto}: ${default_rate}")
+            return RateResult(
+                rate=default_rate,
+                source=RateSource.DEFAULT,
+                timestamp=datetime.utcnow(),
+                currency_pair=currency_pair,
+                confidence=0.5,
+                is_stale=True,
+                error_message="All APIs failed, using default rate",
+            )
+
+        # Complete failure
+        return RateResult(
+            rate=None,
+            source=RateSource.DEFAULT,
+            timestamp=datetime.utcnow(),
+            currency_pair=currency_pair,
+            confidence=0.0,
+            error_message="All rate sources failed",
         )
-        
-        result = await session.execute(stmt)
-        rows = result.all()
-        
-        if not rows:
-            logger.warning(f"⚠️ EXCHANGE_PREFETCH: User {user_id} not found")
+
+    async def get_usd_to_ngn_rate(self) -> RateResult:
+        """Get USD to NGN rate with comprehensive fallbacks"""
+        currency_pair = "USD_NGN"
+
+        # Try multiple sources
+        sources = [
+            (RateSource.FASTFOREX, self._fetch_fastforex_usd_ngn),
+            (RateSource.EXCHANGERATES, self._fetch_exchangerates_usd_ngn),
+        ]
+
+        for source, fetch_func in sources:
+            if self._is_circuit_open(source.value):
+                continue
+
+            try:
+                result = await fetch_func()
+                if result and result.rate:
+                    self._record_success(source.value)
+                    await self._cache_rate(currency_pair, result.rate, source)
+                    return result
+            except Exception as e:
+                self._record_failure(source.value, str(e))
+                continue
+
+        # Try cached data
+        cached_result = await self._get_cached_rate(currency_pair)
+        if cached_result:
+            return cached_result
+
+        # Default NGN rate
+        default_rate = self.default_rates.get("USD_NGN")
+        if default_rate:
+            logger.warning(f"Using default USD to NGN rate: ₦{default_rate}")
+            return RateResult(
+                rate=default_rate,
+                source=RateSource.DEFAULT,
+                timestamp=datetime.utcnow(),
+                currency_pair=currency_pair,
+                confidence=0.6,  # Higher confidence for fiat rates
+                is_stale=True,
+                error_message="All APIs failed, using default rate",
+            )
+
+        return RateResult(
+            rate=None,
+            source=RateSource.DEFAULT,
+            timestamp=datetime.utcnow(),
+            currency_pair=currency_pair,
+            confidence=0.0,
+            error_message="All USD to NGN sources failed",
+        )
+
+    async def _fetch_fastforex_crypto_rate(self, crypto: str) -> Optional[RateResult]:
+        """Fetch crypto rate from FastForex API"""
+        if not Config.FASTFOREX_API_KEY:
             return None
-        
-        # Extract user from first row
-        user = rows[0][0]
-        
-        # Extract all wallets
-        wallets_dict: Dict[str, WalletData] = {}
-        for row in rows:
-            wallet = row[1]
-            if wallet:
-                available_balance = Decimal(str(wallet.available_balance or 0))
-                frozen_balance = Decimal(str(wallet.frozen_balance or 0))
-                trading_credit = Decimal(str(wallet.trading_credit or 0))
-                total_usable = available_balance + trading_credit
-                
-                wallets_dict[wallet.currency] = WalletData(
-                    id=wallet.id,
-                    currency=wallet.currency,
-                    available_balance=available_balance,
-                    frozen_balance=frozen_balance,
-                    trading_credit=trading_credit,
-                    total_usable=total_usable
-                )
-        
-        # Create missing wallets for all supported currencies (for exchanges)
-        # This eliminates future wallet creation queries
-        supported_currencies = Config.CASHOUT_CURRENCIES  # BTC, ETH, LTC, USDT-ERC20, USDT-TRC20, NGN
-        created_wallets = []
-        
-        for currency in supported_currencies:
-            if currency not in wallets_dict:
-                logger.info(f"💳 EXCHANGE_PREFETCH: Creating {currency} wallet for user {user_id}")
-                new_wallet = Wallet(
-                    user_id=user.id,
-                    currency=currency,
-                    available_balance=Decimal('0.00'),
-                    frozen_balance=Decimal('0.00'),
-                    trading_credit=Decimal('0.00')
-                )
-                session.add(new_wallet)
-                created_wallets.append(currency)
-        
-        # Flush to get IDs for newly created wallets
-        if created_wallets:
-            await session.flush()
+
+        try:
+            url = "https://api.fastforex.io/convert"
+            params = {
+                "api_key": Config.FASTFOREX_API_KEY,
+                "from": crypto.upper(),
+                "to": "USD",
+                "amount": "1",
+            }
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if "result" in data and "USD" in data["result"]:
+                            rate = Decimal(str(data["result"]["USD"]))
+                            return RateResult(
+                                rate=rate,
+                                source=RateSource.FASTFOREX,
+                                timestamp=datetime.utcnow(),
+                                currency_pair=f"{crypto.upper()}_USD",
+                                confidence=0.95,
+                            )
+        except Exception as e:
+            logger.error(f"FastForex crypto rate error: {e}")
+            raise
+
+        return None
+
+    async def _fetch_coingecko_crypto_rate(self, crypto: str) -> Optional[RateResult]:
+        """Fetch crypto rate from CoinGecko API"""
+        try:
+            # Map crypto symbols to CoinGecko IDs
+            crypto_ids = {
+                "BTC": "bitcoin",
+                "ETH": "ethereum",
+                "LTC": "litecoin",
+                "DOGE": "dogecoin",
+                "BCH": "bitcoin-cash",
+                "BNB": "binancecoin",
+                "TRX": "tron",
+                "USDT": "tether",
+            }
+
+            crypto_id = crypto_ids.get(crypto.upper())
+            if not crypto_id:
+                return None
+
+            url = "https://api.coingecko.com/api/v3/simple/price"
+            params = {"ids": crypto_id, "vs_currencies": "usd"}
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if crypto_id in data and "usd" in data[crypto_id]:
+                            rate = Decimal(str(data[crypto_id]["usd"]))
+                            return RateResult(
+                                rate=rate,
+                                source=RateSource.COINGECKO,
+                                timestamp=datetime.utcnow(),
+                                currency_pair=f"{crypto.upper()}_USD",
+                                confidence=0.90,
+                            )
+        except Exception as e:
+            logger.error(f"CoinGecko crypto rate error: {e}")
+            raise
+
+        return None
+
+    async def _fetch_coinapi_crypto_rate(self, crypto: str) -> Optional[RateResult]:
+        """Fetch crypto rate from CoinAPI (if API key available)"""
+        api_key = getattr(Config, "COINAPI_KEY", None)
+        if not api_key:
+            return None
+
+        try:
+            url = f"https://rest.coinapi.io/v1/exchangerate/{crypto.upper()}/USD"
+            headers = {"X-CoinAPI-Key": api_key}
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=12)
+            ) as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if "rate" in data:
+                            rate = Decimal(str(data["rate"]))
+                            return RateResult(
+                                rate=rate,
+                                source=RateSource.COINAPI,
+                                timestamp=datetime.utcnow(),
+                                currency_pair=f"{crypto.upper()}_USD",
+                                confidence=0.85,
+                            )
+        except Exception as e:
+            logger.error(f"CoinAPI crypto rate error: {e}")
+            raise
+
+        return None
+
+    async def _fetch_fastforex_usd_ngn(self) -> Optional[RateResult]:
+        """Fetch USD to NGN rate from FastForex"""
+        if not Config.FASTFOREX_API_KEY:
+            return None
+
+        try:
+            url = "https://api.fastforex.io/convert"
+            params = {
+                "api_key": Config.FASTFOREX_API_KEY,
+                "from": "USD",
+                "to": "NGN",
+                "amount": "1",
+            }
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if "result" in data and "NGN" in data["result"]:
+                            rate = Decimal(str(data["result"]["NGN"]))
+                            return RateResult(
+                                rate=rate,
+                                source=RateSource.FASTFOREX,
+                                timestamp=datetime.utcnow(),
+                                currency_pair="USD_NGN",
+                                confidence=0.95,
+                            )
+        except Exception as e:
+            logger.error(f"FastForex USD to NGN error: {e}")
+            raise
+
+        return None
+
+    async def _fetch_exchangerates_usd_ngn(self) -> Optional[RateResult]:
+        """Fetch USD to NGN rate from ExchangeRates API (backup)"""
+        try:
+            url = "https://api.exchangerate-api.com/v4/latest/USD"
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if "rates" in data and "NGN" in data["rates"]:
+                            rate = Decimal(str(data["rates"]["NGN"]))
+                            return RateResult(
+                                rate=rate,
+                                source=RateSource.EXCHANGERATES,
+                                timestamp=datetime.utcnow(),
+                                currency_pair="USD_NGN",
+                                confidence=0.80,
+                            )
+        except Exception as e:
+            logger.error(f"ExchangeRates USD to NGN error: {e}")
+            raise
+
+        return None
+
+    async def _cache_rate(self, currency_pair: str, rate: Decimal, source: RateSource):
+        """Cache rate in production cache system and database for fallback"""
+        try:
+            # Update production cache for fast access
+            set_cached(f"fallback_rate_{currency_pair}", float(rate), ttl=self.cache_duration)
             
-            # Reload wallets to get the IDs
-            for currency in created_wallets:
-                reload_stmt = select(Wallet).where(
-                    Wallet.user_id == user.id,
-                    Wallet.currency == currency
+            # Import here to avoid circular dependency
+            from models import ExchangeRateCache
+
+            with SessionLocal() as session:
+                # Remove old cache entries for this pair
+                session.query(ExchangeRateCache).filter(
+                    ExchangeRateCache.currency_pair == currency_pair
+                ).delete()
+
+                # Add new cache entry
+                cache_entry = ExchangeRateCache(
+                    currency_pair=currency_pair,
+                    rate=rate,
+                    source=source.value,
+                    cached_at=datetime.utcnow(),
+                    expires_at=datetime.utcnow()
+                    + timedelta(seconds=self.cache_duration),
                 )
-                reload_result = await session.execute(reload_stmt)
-                reloaded_wallet = reload_result.scalar_one()
-                
-                wallets_dict[currency] = WalletData(
-                    id=reloaded_wallet.id,
-                    currency=currency,
-                    available_balance=Decimal('0.00'),
-                    frozen_balance=Decimal('0.00'),
-                    trading_credit=Decimal('0.00'),
-                    total_usable=Decimal('0.00')
+                session.add(cache_entry)
+                session.commit()
+
+                logger.debug(f"Cached rate {currency_pair}: {rate} from {source.value}")
+        except Exception as e:
+            logger.error(f"Error caching rate: {e}")
+
+    async def _get_cached_rate(self, currency_pair: str) -> Optional[RateResult]:
+        """Get cached rate from production cache or database"""
+        try:
+            # Try production cache first (fastest)
+            cached_val = get_cached(f"fallback_rate_{currency_pair}")
+            if cached_val is not None:
+                return RateResult(
+                    rate=Decimal(str(cached_val)),
+                    source=RateSource.CACHE,
+                    timestamp=datetime.utcnow(),
+                    currency_pair=currency_pair,
+                    confidence=0.85,
+                    is_stale=False,
                 )
-        
-        # Query 2: Saved destinations (sequential - SQLAlchemy requirement)
-        # Cannot use asyncio.gather() on same session - causes connection issues
-        addresses_stmt = select(SavedAddress).where(SavedAddress.user_id == user_id)
-        addresses_result = await session.execute(addresses_stmt)
-        saved_addresses_models = addresses_result.scalars().all()
-        
-        banks_stmt = select(SavedBankAccount).where(SavedBankAccount.user_id == user_id)
-        banks_result = await session.execute(banks_stmt)
-        saved_banks_models = banks_result.scalars().all()
-        
-        # Convert to dataclasses
-        saved_addresses = [
-            SavedAddressData(
-                id=addr.id,
-                currency=addr.currency,
-                network=addr.network,
-                address=addr.address,
-                label=addr.label
-            )
-            for addr in saved_addresses_models
-        ]
-        
-        saved_banks = [
-            SavedBankData(
-                id=bank.id,
-                account_number=bank.account_number,
-                account_name=bank.account_name,
-                bank_name=bank.bank_name,
-                bank_code=bank.bank_code,
-                label=bank.label
-            )
-            for bank in saved_banks_models
-        ]
-        
-        # Get limits from Config (no database query needed)
-        min_exchange_amount_usd = Decimal(str(Config.MIN_EXCHANGE_AMOUNT_USD))
-        exchange_markup_percentage = Decimal(str(Config.EXCHANGE_MARKUP_PERCENTAGE))
-        
-        # Calculate performance
-        duration_ms = (time.perf_counter() - start_time) * 1000
-        
-        prefetch_data = ExchangePrefetchData(
-            user_id=user.id,
-            telegram_id=user.telegram_id,
-            username=user.username,
-            email=user.email,
-            phone_number=user.phone_number,
-            wallets=wallets_dict,
-            saved_crypto_addresses=saved_addresses,
-            saved_bank_accounts=saved_banks,
-            min_exchange_amount_usd=min_exchange_amount_usd,
-            exchange_markup_percentage=exchange_markup_percentage,
-            prefetch_duration_ms=duration_ms
-        )
-        
-        logger.info(
-            f"⏱️ EXCHANGE_BATCH_OPTIMIZATION: Prefetched exchange context in {duration_ms:.1f}ms "
-            f"(target: <150ms) ✅ - User {user_id}, {len(wallets_dict)} wallets, "
-            f"{len(saved_addresses)} addresses, {len(saved_banks)} banks"
-        )
-        
-        if created_wallets:
-            logger.info(f"💳 EXCHANGE_AUTO_CREATE: Created {len(created_wallets)} missing wallets: {', '.join(created_wallets)}")
-        
-        return prefetch_data
-        
-    except Exception as e:
-        duration_ms = (time.perf_counter() - start_time) * 1000
-        logger.error(f"❌ EXCHANGE_PREFETCH_ERROR: Failed to prefetch context in {duration_ms:.1f}ms: {e}")
+
+            from models import ExchangeRateCache
+
+            with SessionLocal() as session:
+                now = datetime.utcnow()
+
+                # Try fresh cache first
+                fresh_cache = (
+                    session.query(ExchangeRateCache)
+                    .filter(
+                        ExchangeRateCache.currency_pair == currency_pair,
+                        ExchangeRateCache.expires_at > now,
+                    )
+                    .first()
+                )
+
+                if fresh_cache:
+                    logger.debug(f"Using fresh cached rate for {currency_pair}")
+                    return RateResult(
+                        rate=(
+                            Decimal(str(fresh_cache.rate)) if fresh_cache.rate else None
+                        ),
+                        source=RateSource.CACHE,
+                        timestamp=(
+                            datetime.fromisoformat(str(fresh_cache.cached_at))
+                            if fresh_cache.cached_at
+                            else datetime.now(timezone.utc)
+                        ),
+                        currency_pair=currency_pair,
+                        confidence=0.85,
+                        is_stale=False,
+                    )
+
+                # Try stale cache within tolerance
+                stale_cache = (
+                    session.query(ExchangeRateCache)
+                    .filter(
+                        ExchangeRateCache.currency_pair == currency_pair,
+                        ExchangeRateCache.cached_at
+                        > now - timedelta(seconds=self.stale_tolerance),
+                    )
+                    .first()
+                )
+
+                if stale_cache:
+                    logger.warning(f"Using stale cached rate for {currency_pair}")
+                    return RateResult(
+                        rate=(
+                            Decimal(str(stale_cache.rate)) if stale_cache.rate else None
+                        ),
+                        source=RateSource.STALE_CACHE,
+                        timestamp=(
+                            datetime.fromisoformat(str(stale_cache.cached_at))
+                            if stale_cache.cached_at
+                            else datetime.now(timezone.utc)
+                        ),
+                        currency_pair=currency_pair,
+                        confidence=0.70,
+                        is_stale=True,
+                    )
+        except Exception as e:
+            logger.error(f"Error getting cached rate: {e}")
+
         return None
 
+    async def get_rate_with_confidence(
+        self, crypto: str, target_currency: str = "USD"
+    ) -> Tuple[Optional[Decimal], float, str]:
+        """Get rate with confidence score and source info for UI display"""
+        if target_currency == "USD":
+            result = await self.get_crypto_to_usd_rate(crypto)
+        elif target_currency == "NGN":
+            # Get crypto->USD then USD->NGN
+            crypto_result = await self.get_crypto_to_usd_rate(crypto)
+            if not crypto_result.rate:
+                return None, 0.0, "Crypto rate unavailable"
 
-def get_cached_exchange_data(context_user_data: Optional[Dict]) -> Optional[Dict[str, Any]]:
-    """
-    Retrieve cached exchange data from context.user_data
-    
-    CACHING STRATEGY:
-    - Cached at start of exchange operations
-    - Reused across all exchange flows (rate checks, conversions, confirmations)
-    - Invalidated on wallet updates (deposits, withdrawals, exchanges)
-    
-    Args:
-        context_user_data: context.user_data dictionary
-        
-    Returns:
-        Cached exchange prefetch data dictionary, or None if not cached
-    """
-    if not context_user_data:
-        return None
-    
-    return context_user_data.get("exchange_prefetch")
+            ngn_result = await self.get_usd_to_ngn_rate()
+            if not ngn_result.rate:
+                return None, 0.0, "NGN rate unavailable"
+
+            # Combine rates and confidence scores
+            combined_rate = crypto_result.rate * ngn_result.rate
+            combined_confidence = min(crypto_result.confidence, ngn_result.confidence)
+            combined_source = f"{crypto_result.source.value}/{ngn_result.source.value}"
+
+            return combined_rate, combined_confidence, combined_source
+        else:
+            return None, 0.0, f"Unsupported target currency: {target_currency}"
+
+        if result.rate:
+            status = "stale" if result.is_stale else "live"
+            return result.rate, result.confidence, f"{status} ({result.source.value})"
+        else:
+            return None, 0.0, result.error_message or "Rate unavailable"
+
+    async def health_check(self) -> Dict[str, Any]:
+        """Check health of all rate sources"""
+        health_status = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "sources": {},
+            "circuit_breakers": {},
+        }
+
+        # Check each source
+        for source in [
+            RateSource.FASTFOREX,
+            RateSource.COINGECKO,
+            RateSource.EXCHANGERATES,
+        ]:
+            cb = self._get_circuit_breaker(source.value)
+            health_status["circuit_breakers"][source.value] = {
+                "is_open": cb.is_open,
+                "failure_count": cb.failure_count,
+                "last_failure": (
+                    cb.last_failure.isoformat() if cb.last_failure else None
+                ),
+            }
+
+        # Test a sample rate fetch
+        try:
+            btc_result = await self.get_crypto_to_usd_rate("BTC")
+            health_status["sample_btc_rate"] = {
+                "rate": float(btc_result.rate) if btc_result.rate else None,
+                "source": btc_result.source.value,
+                "confidence": btc_result.confidence,
+                "is_stale": btc_result.is_stale,
+            }
+        except Exception as e:
+            health_status["sample_btc_rate"] = {"error": str(e)}
+
+        return health_status
 
 
-def cache_exchange_data(context_user_data: Dict, prefetch_data: ExchangePrefetchData) -> None:
-    """
-    Store exchange data in context.user_data for reuse across conversation steps
-    
-    CACHING STRATEGY:
-    - Cached at start of exchange flow (currency selection, amount input, rate check)
-    - Reused in all subsequent steps (no DB queries needed)
-    - Invalidated on wallet state changes (exchanges completed, deposits received)
-    
-    Args:
-        context_user_data: context.user_data dictionary
-        prefetch_data: Prefetched exchange context
-    """
-    if context_user_data is not None:
-        context_user_data["exchange_prefetch"] = prefetch_data.to_dict()
-        logger.info(f"✅ EXCHANGE_CACHE: Stored prefetch data for user {prefetch_data.user_id}")
+# Global instance
+exchange_rate_fallback_service = ExchangeRateFallbackService()
 
-
-def invalidate_exchange_cache(context_user_data: Optional[Dict]) -> None:
-    """
-    Clear cached exchange data from context
-    
-    INVALIDATION TRIGGERS:
-    - Exchange completed
-    - Wallet deposit completed
-    - Balance transfer
-    - Rate lock expired
-    - Session timeout
-    
-    Args:
-        context_user_data: context.user_data dictionary
-    """
-    if context_user_data and "exchange_prefetch" in context_user_data:
-        context_user_data.pop("exchange_prefetch", None)
-        logger.info("🗑️ EXCHANGE_CACHE: Invalidated prefetch data")
+# Backward compatibility alias
+rate_service = exchange_rate_fallback_service
