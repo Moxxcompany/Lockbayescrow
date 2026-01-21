@@ -343,6 +343,17 @@ class EmailVerificationService:
             result = session.execute(stmt)
             verification_id = result.scalar_one()
             
+            # CRITICAL FIX: Trigger background email send IMMEDIATELY after record creation
+            # Previously this was missing in some paths, causing records to exist but emails not to fire
+            logger.info(f"🚀 TRIGGER_EMAIL: Queueing background email for verification {verification_id}")
+            asyncio.create_task(cls._send_email_background_task_safe(
+                verification_id=verification_id,
+                email=email,
+                purpose=purpose,
+                expiry_minutes=expiry_minutes,
+                user_id=user_id
+            ))
+            
             logger.info(f"✅ OTP record created for {email} for user {user_id} (purpose: {purpose}) - DB operation complete")
             return {
                 "success": True,
