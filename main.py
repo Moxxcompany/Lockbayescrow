@@ -209,6 +209,7 @@ def register_emergency_handlers(application):
     from handlers.exchange_handler import ExchangeHandler
     from handlers.multi_dispute_manager_direct import direct_select_dispute
     from handlers.payment_recovery_handler import PaymentRecoveryHandler
+    from handlers.wallet_direct import show_crypto_funding_options
     
     # Create wrapper functions for handlers that need parameter adaptation
     async def handle_escrow_history_wrapper(update, context):
@@ -252,6 +253,7 @@ def register_emergency_handlers(application):
         (ExchangeHandler.show_exchange_history, '^exchange_history$'),  # FIX: Missing exchange history handler (static method)
         (handle_main_menu_callback, '^main_menu$'),  # FIX: Missing main menu handler
         (handle_menu_support, '^menu_support$'),  # FIX: Missing support button handler
+        (show_crypto_funding_options, '^(crypto_funding_start|crypto_funding_start_direct)$'), # FIX: Crypto selection
         # ✅ PAYMENT RECOVERY HANDLERS: For underpayment action buttons
         (PaymentRecoveryHandler.handle_complete_payment, '^pay_complete:'),  # Complete payment button
         (PaymentRecoveryHandler.handle_proceed_partial, '^pay_partial:'),  # Proceed with partial amount button
