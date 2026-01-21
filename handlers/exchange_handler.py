@@ -66,6 +66,7 @@ logger = logging.getLogger(__name__)
 from utils.user_cache import user_cache
 
 # PERFORMANCE OPTIMIZATION: Exchange context prefetch (reduces 57 queries to 2)
+import utils.exchange_prefetch as exchange_prefetch
 from utils.exchange_prefetch import (
     prefetch_exchange_context,
     get_cached_exchange_data,
