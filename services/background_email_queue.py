@@ -367,7 +367,7 @@ class BackgroundEmailQueue:
             logger.info(f"📧 Processing background email job for {email_job.recipient}")
             
             # Send email using the email service
-            success = self.email_service.send_email(
+            success = await self.email_service.send_email_async(
                 to_email=email_job.recipient,
                 subject=email_job.subject,
                 html_content=email_job.html_content,
