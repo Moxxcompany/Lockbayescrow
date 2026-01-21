@@ -151,7 +151,9 @@ class BackgroundEmailQueue:
         """
         # No-op mode: Return failure to trigger direct email fallback
         if self._noop_mode or self.replit_queue is None:
-            logger.debug(f"📧 NO-OP mode: Triggering direct email fallback for {recipient}")
+            logger.info(f"📧 NO-OP mode: Triggering direct email fallback for {recipient}")
+            # IMPORTANT: For testing or fallback, we need to return specific success to avoid infinite loops
+            # if the caller handles fallback correctly.
             return {
                 "success": False,
                 "error": "queue_unavailable",
