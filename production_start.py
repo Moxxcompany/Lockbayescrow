@@ -79,13 +79,16 @@ def validate_webhook_secrets():
     logger = logging.getLogger(__name__)
     
     required_secrets = [
-        # ("FINCRA_WEBHOOK_ENCRYPTION_KEY", "Fincra"),
-        # ("DYNOPAY_WEBHOOK_SECRET", "DynoPay"),
+        ("FINCRA_WEBHOOK_ENCRYPTION_KEY", "Fincra"),
+        ("DYNOPAY_WEBHOOK_SECRET", "DynoPay"),
     ]
     
     missing = []
     for secret_name, provider in required_secrets:
         if not os.getenv(secret_name):
+            if os.getenv("BYPASS_WEBHOOK_VALIDATION") == "true":
+                logger.warning(f"⚠️ BYPASS: Missing {provider} secret ({secret_name}), but continuing due to BYPASS_WEBHOOK_VALIDATION=true")
+                continue
             missing.append(f"{provider} ({secret_name})")
     
     if missing:
