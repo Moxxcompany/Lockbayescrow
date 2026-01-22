@@ -1043,12 +1043,16 @@ async def show_wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         reserved_in_escrows = max(safe_subtract(wallet_available_decimal, withdrawable_balance), Decimal("0"))
         
         # Build enhanced balance display with clear breakdown
-        if reserved_in_escrows > 0:
-            # User has funds locked in active escrows - show detailed breakdown
-            balance_fmt = f"""💰 Wallet Balance: {format_clean_amount(wallet_available_decimal)} USD
-🔒 Locked in Trades: {format_clean_amount(reserved_in_escrows)} USD
-✅ Withdrawable: {format_clean_amount(withdrawable_balance)} USD"""
+        if trading_credit_bal > 0 or reserved_in_escrows > 0:
+            # User has funds locked in active escrows or trading credit - show detailed breakdown
+            balance_fmt = f"💰 Wallet Balance: {format_clean_amount(wallet_available_decimal)} USD"
             
+            if reserved_in_escrows > 0:
+                balance_fmt += f"\n🔒 Locked in Trades: {format_clean_amount(reserved_in_escrows)} USD"
+                balance_fmt += f"\n✅ Withdrawable: {format_clean_amount(withdrawable_balance)} USD"
+            else:
+                balance_fmt += f"\n✅ Withdrawable: {format_clean_amount(wallet_available_decimal)} USD"
+                
             if trading_credit_bal > 0:
                 balance_fmt += f"\n💎 Trading Credit: {format_clean_amount(trading_credit_bal)} USD (bonus, non-withdrawable)"
         elif locked_bal > 0:
