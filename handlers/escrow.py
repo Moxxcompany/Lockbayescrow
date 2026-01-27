@@ -1802,9 +1802,10 @@ async def show_fee_split_options(query, context: ContextTypes.DEFAULT_TYPE) -> O
         total_fee_display = format_money(total_fee, 'USD')
         
         # Check if minimum fee was applied (only show tooltip when relevant)
-        min_fee_threshold = Decimal(str(getattr(Config, 'MIN_ESCROW_FEE_THRESHOLD', 100)))
-        min_fee_amount = Decimal(str(getattr(Config, 'MIN_ESCROW_FEE_AMOUNT', 10)))
-        calculated_fee = (amount * Decimal("0.05")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        min_fee_threshold = Decimal(str(Config.MIN_ESCROW_FEE_THRESHOLD))
+        min_fee_amount = Decimal(str(Config.MIN_ESCROW_FEE_AMOUNT))
+        fee_percentage = Decimal(str(Config.ESCROW_FEE_PERCENTAGE)) / Decimal("100")
+        calculated_fee = (amount * fee_percentage).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         
         # Show tooltip if: escrow under threshold AND minimum fee was applied
         show_min_fee_note = (
@@ -1976,9 +1977,10 @@ async def show_fee_split_options_from_message(
         total_fee_display = format_money(total_fee, 'USD')
         
         # Check if minimum fee was applied (only show tooltip when relevant)
-        min_fee_threshold = Decimal(str(getattr(Config, 'MIN_ESCROW_FEE_THRESHOLD', 100)))
-        min_fee_amount = Decimal(str(getattr(Config, 'MIN_ESCROW_FEE_AMOUNT', 10)))
-        calculated_fee = (amount * Decimal("0.05")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        min_fee_threshold = Decimal(str(Config.MIN_ESCROW_FEE_THRESHOLD))
+        min_fee_amount = Decimal(str(Config.MIN_ESCROW_FEE_AMOUNT))
+        fee_percentage = Decimal(str(Config.ESCROW_FEE_PERCENTAGE)) / Decimal("100")
+        calculated_fee = (amount * fee_percentage).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         
         # Show tooltip if: escrow under threshold AND minimum fee was applied
         show_min_fee_note = (
