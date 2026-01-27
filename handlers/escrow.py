@@ -2865,7 +2865,7 @@ async def handle_make_payment(update: TelegramUpdate, context: ContextTypes.DEFA
             # Show payment method selection directly (wallet/crypto/NGN options)
             # Calculate total amount from escrow data
             amount = Decimal(str(escrow_data["amount"]))
-            buyer_fee = Decimal(str(escrow_data.get("buyer_fee", amount * Decimal("0.05"))))
+            buyer_fee = Decimal(str(escrow_data.get("buyer_fee", get_default_fee(amount))))
             total_amount = amount + buyer_fee
             
             # Get wallet balance for display
