@@ -1885,7 +1885,7 @@ Enter the 6-digit code to complete trade acceptance:"""
                         "verification_code": otp,
                         "verified": False,
                         "expires_at": expiry_time,
-                        "purpose": "onboarding",
+                        "purpose": "registration",  # FIX: Align with OnboardingService
                         "attempts": 0,
                         "max_attempts": 5,
                         "created_at": datetime.now(timezone.utc),
@@ -1909,7 +1909,7 @@ Enter the 6-digit code to complete trade acceptance:"""
             queue_result = await background_email_queue.queue_otp_email(
                 recipient=text,
                 otp_code=otp,
-                purpose="onboarding",
+                purpose="registration",  # FIX: Align with OnboardingService
                 user_id=user.id,
                 user_name=user_name
             )
