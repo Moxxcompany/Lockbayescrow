@@ -2108,7 +2108,7 @@ async def handle_resend_otp_onboarding(
                 "verification_code": otp,
                 "verified": False,
                 "expires_at": expires_at,
-                "purpose": "onboarding",
+                "purpose": "registration",  # FIX: Align with OnboardingService
                 "attempts": 0,
                 "max_attempts": 5,
                 "created_at": datetime.now(timezone.utc),
@@ -2128,7 +2128,7 @@ async def handle_resend_otp_onboarding(
             queue_result = await background_email_queue.queue_otp_email(
                 recipient=as_str(db_user.email) or "",
                 otp_code=otp,
-                purpose="onboarding",
+                purpose="registration",  # FIX: Align with OnboardingService
                 user_id=db_user.id,
                 user_name=as_str(db_user.first_name) or 'User'
             )
