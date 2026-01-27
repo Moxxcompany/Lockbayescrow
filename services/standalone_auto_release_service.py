@@ -190,14 +190,21 @@ class StandaloneAutoReleaseService:
                             if locked_escrow.status != str(EscrowStatus.ACTIVE.value):
                                 continue
 
-                            # Release funds to seller atomically
+                            # Calculate release amount (escrow amount minus seller fees)
+                            escrow_amount = Decimal(str(locked_escrow.amount))
+                            seller_fee = Decimal(str(locked_escrow.seller_fee_amount)) if locked_escrow.seller_fee_amount else Decimal("0.0")
+                            release_amount = escrow_amount - seller_fee
+                            
+                            logger.info(f"💰 Auto-release {locked_escrow.escrow_id}: amount=${escrow_amount}, seller_fee=${seller_fee}, release_amount=${release_amount}")
+
+                            # Release funds to seller atomically (after deducting seller fee)
                             release_success = CryptoServiceAtomic.credit_user_wallet_atomic(
                                 user_id=locked_escrow.seller_id,
-                                amount=float(locked_escrow.amount),
+                                amount=float(release_amount),  # FIX: Use release_amount, not full amount
                                 currency="USD",
                                 escrow_id=locked_escrow.id,
                                 transaction_type="escrow_release",
-                                description=f"Auto-release payment for escrow {locked_escrow.escrow_id}",
+                                description=f"Auto-release payment for escrow {locked_escrow.escrow_id} (Fee: ${seller_fee})",
                                 session=session,
                             )
 
