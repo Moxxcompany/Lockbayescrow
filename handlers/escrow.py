@@ -5590,19 +5590,21 @@ async def process_immediate_wallet_payment(query, context, user, total_amount, s
         fee_split_option = escrow_data.get("fee_split_option", "split")
         amount = Decimal(str(escrow_data["amount"]))
 
-        # Apply correct fee defaults based on split option
+        # Apply correct fee defaults based on split option using Config fee percentage
+        default_fee = get_default_fee(amount)
+        half_fee = (default_fee / Decimal("2")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        
         if fee_split_option == "buyer_pays":
             buyer_fee = Decimal(
-                str(escrow_data.get("buyer_fee", amount * Decimal("0.05")))
+                str(escrow_data.get("buyer_fee", default_fee))
             )
             seller_fee = Decimal(str(escrow_data.get("seller_fee", Decimal("0"))))
         elif fee_split_option == "seller_pays":
             buyer_fee = Decimal(str(escrow_data.get("buyer_fee", Decimal("0"))))
             seller_fee = Decimal(
-                str(escrow_data.get("seller_fee", amount * Decimal("0.05")))
+                str(escrow_data.get("seller_fee", default_fee))
             )
         else:  # split
-            half_fee = amount * Decimal("0.025")  # 2.5% each for 5% total
             buyer_fee = Decimal(str(escrow_data.get("buyer_fee", half_fee)))
             seller_fee = Decimal(str(escrow_data.get("seller_fee", half_fee)))
 
