@@ -11,6 +11,7 @@ Can be run independently or called from the main application.
 import asyncio
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import List, Optional
 
 # Database imports
