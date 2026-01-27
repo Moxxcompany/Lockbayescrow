@@ -1217,14 +1217,20 @@ class AutoCashoutService:
             except Exception as notify_error:
                 logger.error(f"Failed to notify admin of cashout started {cashout_request.cashout_id}: {notify_error}")
 
-            # Credit user's wallet for the transaction
+            # Credit user's wallet for the transaction (after deducting seller fee)
+            escrow_amount = Decimal(str(escrow.amount))
+            seller_fee = Decimal(str(escrow.seller_fee_amount)) if escrow.seller_fee_amount else Decimal("0.0")
+            release_amount = escrow_amount - seller_fee
+            
+            logger.info(f"💰 Admin cashout {escrow.escrow_id}: amount=${escrow_amount}, seller_fee=${seller_fee}, release_amount=${release_amount}")
+            
             success = CryptoServiceAtomic.credit_user_wallet_atomic(
                 seller.id,
-                Decimal(str(escrow.amount)),
+                release_amount,  # FIX: Use release_amount, not full escrow.amount
                 "USD",
                 escrow_id=int(escrow.id),  # type: ignore[arg-type]
                 transaction_type="escrow_release",
-                description=f"💼 Trade payment from {escrow.buyer.full_name or escrow.buyer.username} for #{escrow.escrow_id} (Pending admin cashout approval)",
+                description=f"💼 Trade payment from {escrow.buyer.full_name or escrow.buyer.username} for #{escrow.escrow_id} (Fee: ${seller_fee})",
             )
 
             if success:
