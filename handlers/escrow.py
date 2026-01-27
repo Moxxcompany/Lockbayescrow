@@ -1753,16 +1753,17 @@ async def show_fee_split_options(query, context: ContextTypes.DEFAULT_TYPE) -> O
         context.user_data["escrow_data"] = escrow_data  # type: ignore[index]
         
         # Calculate normal fee with minimum fee system (what they WOULD have paid)
-        calculated_fee = (amount * Decimal("0.05")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        fee_percentage = Decimal(str(Config.ESCROW_FEE_PERCENTAGE)) / Decimal("100")
+        calculated_fee = (amount * fee_percentage).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         
-        # Apply minimum fee logic: escrows under $100 have $10 minimum fee
-        min_fee_threshold = Decimal(str(getattr(Config, 'MIN_ESCROW_FEE_THRESHOLD', 100)))
-        min_fee_amount = Decimal(str(getattr(Config, 'MIN_ESCROW_FEE_AMOUNT', 10)))
+        # Apply minimum fee logic: escrows under threshold have minimum fee
+        min_fee_threshold = Decimal(str(Config.MIN_ESCROW_FEE_THRESHOLD))
+        min_fee_amount = Decimal(str(Config.MIN_ESCROW_FEE_AMOUNT))
         
         if amount < min_fee_threshold and calculated_fee < min_fee_amount:
             normal_fee = min_fee_amount  # They would have paid minimum fee
         else:
-            normal_fee = calculated_fee  # They would have paid 5%
+            normal_fee = calculated_fee  # They would have paid configured %
         
         # Show celebration message with Continue button
         text = (
@@ -1926,16 +1927,17 @@ async def show_fee_split_options_from_message(
         context.user_data["escrow_data"] = escrow_data  # type: ignore[index]
         
         # Calculate normal fee with minimum fee system (what they WOULD have paid)
-        calculated_fee = (amount * Decimal("0.05")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        fee_percentage = Decimal(str(Config.ESCROW_FEE_PERCENTAGE)) / Decimal("100")
+        calculated_fee = (amount * fee_percentage).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         
-        # Apply minimum fee logic: escrows under $100 have $10 minimum fee
-        min_fee_threshold = Decimal(str(getattr(Config, 'MIN_ESCROW_FEE_THRESHOLD', 100)))
-        min_fee_amount = Decimal(str(getattr(Config, 'MIN_ESCROW_FEE_AMOUNT', 10)))
+        # Apply minimum fee logic: escrows under threshold have minimum fee
+        min_fee_threshold = Decimal(str(Config.MIN_ESCROW_FEE_THRESHOLD))
+        min_fee_amount = Decimal(str(Config.MIN_ESCROW_FEE_AMOUNT))
         
         if amount < min_fee_threshold and calculated_fee < min_fee_amount:
             normal_fee = min_fee_amount  # They would have paid minimum fee
         else:
-            normal_fee = calculated_fee  # They would have paid 5%
+            normal_fee = calculated_fee  # They would have paid configured %
         
         # Show celebration message with Continue button
         celebration_text = (
