@@ -1168,7 +1168,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                     result = await session.execute(
                         select(EmailVerification).filter(
                             EmailVerification.user_id == user_id_db,
-                            EmailVerification.purpose == "onboarding",
+                            EmailVerification.purpose == "registration",  # FIX: Align with OnboardingService
                             EmailVerification.expires_at > datetime.now(timezone.utc)
                         )
                     )
